@@ -54,6 +54,40 @@ CREATE TABLE IF NOT EXISTS requests(
  PRIMARY KEY(scope,request));
 """
 
+# Version 2 stores all business state here.  The tables above are kept as
+# read-only audit after a cutover; nothing in the version 2 code path reads them.
+TARGET_STATEMENTS = (
+    """CREATE TABLE IF NOT EXISTS target_revisions(
+       id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL,
+       plan TEXT NOT NULL, execution TEXT NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS target_heads(
+       name TEXT PRIMARY KEY, revision INTEGER NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS target_batches(
+       id INTEGER PRIMARY KEY AUTOINCREMENT, digest TEXT NOT NULL,
+       row_count INTEGER NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS target_raw_lines(
+       batch INTEGER NOT NULL, position INTEGER NOT NULL,
+       text TEXT NOT NULL, PRIMARY KEY(batch,position))""",
+    """CREATE TABLE IF NOT EXISTS target_jobs(
+       id INTEGER PRIMARY KEY AUTOINCREMENT, batch INTEGER NOT NULL,
+       revision INTEGER NOT NULL, mapping TEXT NOT NULL,
+       state TEXT NOT NULL CHECK(state IN ('pending','failed','succeeded')),
+       error TEXT)""",
+    """CREATE TABLE IF NOT EXISTS target_results(
+       job INTEGER PRIMARY KEY, row_count INTEGER NOT NULL)""",
+    """CREATE TABLE IF NOT EXISTS target_result_rows(
+       job INTEGER NOT NULL, position INTEGER NOT NULL,
+       payload TEXT NOT NULL, PRIMARY KEY(job,position))""",
+    """CREATE TABLE IF NOT EXISTS target_requests(
+       scope TEXT NOT NULL, request TEXT NOT NULL, payload TEXT NOT NULL,
+       result INTEGER NOT NULL, PRIMARY KEY(scope,request))""",
+)
+
+
+def create_target_schema(connection):
+    for statement in TARGET_STATEMENTS:
+        connection.execute(statement)
+
 
 class Database:
     """One worker per file; transactions also serve maintenance operations."""
@@ -63,12 +97,21 @@ class Database:
         self.connection.execute('PRAGMA foreign_keys=ON')
         try:
             self.connection.executescript(SCHEMA)
-            if self.connection.execute(
-                    "SELECT value FROM metadata WHERE key='storage_version'").fetchone()[0] != '1':
+            if self.storage_version() not in ('1', '2'):
                 raise Invalid('unsupported storage version')
         except BaseException:
             self.connection.close()
             raise
+
+    def storage_version(self):
+        row = self.connection.execute(
+            "SELECT value FROM metadata WHERE key='storage_version'").fetchone()
+        if row is None:
+            raise Invalid('missing storage version')
+        return row[0]
+
+    def is_v2(self):
+        return self.storage_version() == '2'
 
     @contextmanager
     def transaction(self, write=True):
@@ -80,11 +123,14 @@ class Database:
             self.connection.rollback()
             raise
 
+    def request_table(self):
+        return 'target_requests' if self.is_v2() else 'requests'
+
     def replay(self, scope, request, payload):
         token(request, 'request_id')
         row = self.connection.execute(
-            'SELECT payload,result FROM requests WHERE scope=? AND request=?',
-            (scope, request)).fetchone()
+            'SELECT payload,result FROM ' + self.request_table()
+            + ' WHERE scope=? AND request=?', (scope, request)).fetchone()
         if row is None:
             return None
         if row['payload'] != encode(payload):
@@ -92,8 +138,9 @@ class Database:
         return row['result']
 
     def remember(self, scope, request, payload, result):
-        self.connection.execute('INSERT INTO requests VALUES(?,?,?,?)',
-                                (scope, request, encode(payload), result))
+        self.connection.execute(
+            'INSERT INTO ' + self.request_table() + ' VALUES(?,?,?,?)',
+            (scope, request, encode(payload), result))
 
     def close(self):
         self.connection.close()

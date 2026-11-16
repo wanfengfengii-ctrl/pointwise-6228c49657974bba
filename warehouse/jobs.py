@@ -8,6 +8,9 @@ class Jobs:
         self.registry = registry
         self.batches = batches
 
+    def _table(self, base):
+        return 'target_' + base if self.db.is_v2() else base
+
     def create(self, batch, mapping, request_id, *, name=None, revision=None):
         token(request_id, 'request_id')
         if (name is None) == (revision is None):
@@ -34,7 +37,8 @@ class Jobs:
             if any(group not in groups for group in mapping.values()):
                 raise Invalid('mapping references an unknown capture')
             job = con.execute(
-                "INSERT INTO jobs(batch,revision,mapping,state) VALUES(?,?,?,'pending')",
+                'INSERT INTO ' + self._table('jobs')
+                + "(batch,revision,mapping,state) VALUES(?,?,?,'pending')",
                 (batch, plan['revision'], encode(mapping))).lastrowid
             self.db.remember('job', request_id, payload, job)
             return self.get(job)
@@ -42,7 +46,8 @@ class Jobs:
     def get(self, job):
         if type(job) is not int:
             raise Invalid('job must be an integer')
-        row = self.db.connection.execute('SELECT * FROM jobs WHERE id=?', (job,)).fetchone()
+        row = self.db.connection.execute(
+            'SELECT * FROM ' + self._table('jobs') + ' WHERE id=?', (job,)).fetchone()
         if row is None:
             raise NotFound('unknown job')
         return {'job': row['id'], 'batch': row['batch'], 'revision': row['revision'],
